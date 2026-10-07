@@ -1,7 +1,42 @@
-name: CI
-on: pull_request
+name: Auto-merge bypass test
+on: workflow_dispatch
+permissions: { contents: write, pull-requests: write }
 jobs:
-  ci:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "ok"
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.TEST_APP_ID }}
+          private-key: ${{ secrets.TEST_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with: { token: "${{ steps.app-token.outputs.token }}" }
+      - name: Open PR as the app and enable native auto-merge
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BR="automerge-test-$(date +%s)"
+          git config user.name app-bot; git config user.email app@bot.local
+          git checkout -b "$BR"
+          echo "probe $(date)" >> probe.txt && git add probe.txt
+          git commit -m "probe"; git push origin "$BR"
+          PR=$(curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/$REPO/pulls \
+            -d "$(jq -n --arg h "$BR" '{title:"automerge bypass test",head:$h,base:"main",body:"test"}')")
+          N=$(echo "$PR" | jq -r .number); ID=$(echo "$PR" | jq -r .node_id)
+          echo "opened PR #$N"
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/graphql \
+            -d "$(jq -n --arg id "$ID" '{query:"mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:MERGE}){pullRequest{number}}}",variables:{id:$id}}')"
+          echo "auto-merge enabled (no human approval will be given); polling..."
+          for i in $(seq 1 20); do
+            sleep 30
+            J=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" https://api.github.com/repos/$REPO/pulls/$N)
+            M=$(echo "$J" | jq -r .merged); S=$(echo "$J" | jq -r .mergeable_state)
+            echo "  attempt $i: merged=$M mergeable_state=$S"
+            [ "$M" = "true" ] && echo ">>> RESULT: auto-merge HONORED the bypass (merged with NO review)" && exit 0
+          done
+          echo ">>> RESULT: auto-merge did NOT merge — bypass NOT applied to auto-merge (stuck on review)"
